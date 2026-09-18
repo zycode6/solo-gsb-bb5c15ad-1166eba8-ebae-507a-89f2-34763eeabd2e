@@ -9,6 +9,11 @@
   视为数据中断，强制分段；
 - 连续的超限读数（中间没有恢复正常）始终属于同一事件。
 
+规则版本机制：
+- 每条规则版本带一个生效时间 effective_at；读数只使用当时已生效的最新版本；
+- 规则版本切换点必须切断旧事件：切换点两侧的读数分别独立识别，
+  禁止跨版本合并（短暂恢复、容忍时长均不能跨越版本边界）。
+
 时长口径（基于离散采样点的区间归属近似）：
 - 事件起点 = 首个超限读数时间；
 - 事件终点 = 最后一次超限之后首个恢复正常读数的时间；
@@ -19,6 +24,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -35,6 +41,15 @@ class Rule:
 class Reading:
     ts: datetime
     temperature: float
+
+
+@dataclass(frozen=True)
+class RuleVersion:
+    """一条规则版本：rule 自 effective_at（含）起生效。"""
+
+    version: int
+    effective_at: datetime
+    rule: Rule
 
 
 def is_violation(temperature: float, rule: Rule) -> bool:
@@ -137,3 +152,57 @@ def _summarize(window: list[Reading], rule: Rule) -> dict:
         "min_temp": min(r.temperature for r in span),
         "reading_count": len(span),
     }
+
+
+def rule_at(ts: datetime, versions: list[RuleVersion]) -> RuleVersion | None:
+    """返回 ts 时刻已生效的最新规则版本（effective_at <= ts），没有则 None。
+
+    versions 必须按 effective_at 升序排列。
+    """
+    if not versions:
+        return None
+    keys = [v.effective_at for v in versions]
+    idx = bisect_right(keys, ts) - 1
+    return versions[idx] if idx >= 0 else None
+
+
+def detect_versioned_events(
+    readings: list[Reading], versions: list[RuleVersion]
+) -> list[dict]:
+    """按规则版本识别事件。
+
+    对每条读数应用当时已生效的最新版本；版本切换点强制结束旧事件，
+    切换点两侧分别用各自版本独立识别，禁止跨版本合并。
+    早于首个版本生效时间的读数没有适用规则，直接忽略。
+    返回的每个事件带有 rule_version 与 rule_effective_at。
+    """
+    ordered_versions = sorted(versions, key=lambda v: v.effective_at)
+    effective_times = [v.effective_at for v in ordered_versions]
+    ordered = sorted(readings, key=lambda r: r.ts)
+
+    events: list[dict] = []
+    block: list[Reading] = []          # 当前版本连续片段内的读数
+    current_version: RuleVersion | None = None
+
+    def _flush() -> None:
+        # 版本切换是硬边界：旧片段的事件到此为止，绝不与新版本合并
+        if block and current_version is not None:
+            for ev in detect_events(block, current_version.rule):
+                ev["rule_version"] = current_version.version
+                ev["rule_effective_at"] = current_version.effective_at
+                events.append(ev)
+
+    for r in ordered:
+        idx = bisect_right(effective_times, r.ts) - 1
+        if idx < 0:
+            # 首个版本生效之前的读数：无适用规则
+            continue
+        rv = ordered_versions[idx]
+        if current_version is not None and rv is not current_version:
+            _flush()
+            block = []
+        current_version = rv
+        block.append(r)
+
+    _flush()
+    return events

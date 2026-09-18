@@ -2,11 +2,19 @@
 
 from datetime import datetime, timedelta, timezone
 
-from app.events import Reading, Rule, detect_events
+from app.events import Reading, Rule, RuleVersion, detect_events, detect_versioned_events
 
 BASE = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 # 上限 8℃、下限 2℃、容忍 5 分钟、最大间隔 30 分钟
 RULE = Rule(upper_limit=8.0, lower_limit=2.0, tolerance_seconds=300, max_gap_seconds=1800)
+
+
+def rv(version: int, effective_minutes: float, rule: Rule = RULE) -> RuleVersion:
+    return RuleVersion(
+        version=version,
+        effective_at=BASE + timedelta(minutes=effective_minutes),
+        rule=rule,
+    )
 
 
 def r(minutes: float, temp: float) -> Reading:
@@ -155,3 +163,87 @@ class TestOrdering:
         assert len(events) == 1
         assert events[0]["start_time"] == BASE
         assert events[0]["violation_seconds"] == 20 * 60
+
+
+class TestVersionedEvents:
+    def test_single_version_behaves_like_detect_events(self):
+        readings = [r(0, 9.0), r(10, 5.0), r(20, 9.0), r(30, 5.0)]
+        events = detect_versioned_events(readings, [rv(1, -1000)])
+        assert len(events) == 2
+        assert all(e["rule_version"] == 1 for e in events)
+        assert all(e["rule_effective_at"] == BASE - timedelta(minutes=1000)
+                   for e in events)
+
+    def test_switch_point_splits_event_and_tags_versions(self):
+        # 版本切换（30 分钟处）两侧都在超限 → 必须切成两个事件
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(20, 9.5),
+            r(30, 9.2),   # 起适用 v2
+            r(40, 5.0),
+        ], [rv(1, 0), rv(2, 30)])
+        assert len(events) == 2
+        old, new = events
+        assert old["rule_version"] == 1
+        assert old["start_time"] == BASE
+        assert old["end_time"] == BASE + timedelta(minutes=20)  # 切换点闭合
+        assert old["ongoing"] is True
+        assert new["rule_version"] == 2
+        assert new["rule_effective_at"] == BASE + timedelta(minutes=30)
+        assert new["start_time"] == BASE + timedelta(minutes=30)
+        assert new["end_time"] == BASE + timedelta(minutes=40)
+        # 20→30 的区间跨越版本边界，不计入任何一侧的超限时长
+        assert old["violation_seconds"] == 20 * 60
+        assert new["violation_seconds"] == 10 * 60
+
+    def test_no_cross_version_tolerance_merge(self):
+        # v1 超限后短暂恢复，切换到 v2 后立刻再超限；
+        # 即便恢复时长（2 分钟）< 容忍时长（5 分钟）也禁止跨版本合并
+        events = detect_versioned_events([
+            r(0, 9.0),
+            r(10, 5.0),   # 恢复（v1）
+            r(12, 9.2),   # v2 下再次超限
+            r(20, 5.0),
+        ], [rv(1, 0), rv(2, 11)])
+        assert len(events) == 2
+        assert [e["rule_version"] for e in events] == [1, 2]
+        assert events[0]["end_time"] == BASE + timedelta(minutes=10)
+        assert events[1]["start_time"] == BASE + timedelta(minutes=12)
+
+    def test_each_reading_uses_rule_effective_at_that_time(self):
+        # v1 上限 6℃ → 7℃ 算超限；v2（10 分钟起）上限放宽到 8℃ → 7℃ 正常
+        rule_low = Rule(upper_limit=6.0, lower_limit=2.0,
+                        tolerance_seconds=300, max_gap_seconds=1800)
+        events = detect_versioned_events([
+            r(0, 7.0),    # v1：超限
+            r(5, 7.0),    # v1：仍超限
+            r(10, 7.0),   # v2：限值放宽，同一温度变为正常读数
+        ], [rv(1, 0, rule_low), rv(2, 10, RULE)])
+        # 只有 v1 下的一个事件；v2 片段没有超限读数，不产生事件，也不回切旧事件
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["rule_version"] == 1
+        assert ev["event_type"] == "high"
+        assert ev["start_time"] == BASE
+        assert ev["end_time"] == BASE + timedelta(minutes=5)
+        assert ev["violation_seconds"] == 5 * 60
+
+    def test_readings_before_first_version_are_ignored(self):
+        events = detect_versioned_events([
+            r(0, 99.0),   # 首个版本 5 分钟才生效 → 忽略
+            r(10, 9.0),   # v1 下超限
+            r(20, 5.0),
+        ], [rv(1, 5)])
+        assert len(events) == 1
+        assert events[0]["rule_version"] == 1
+        assert events[0]["start_time"] == BASE + timedelta(minutes=10)
+
+    def test_versions_unsorted_are_handled(self):
+        events = detect_versioned_events([
+            r(0, 9.0), r(20, 9.0), r(30, 5.0),
+        ], [rv(2, 15), rv(1, 0)])
+        assert len(events) == 2
+        assert [e["rule_version"] for e in events] == [1, 2]
+
+    def test_no_versions_no_events(self):
+        assert detect_versioned_events([r(0, 9.0)], []) == []

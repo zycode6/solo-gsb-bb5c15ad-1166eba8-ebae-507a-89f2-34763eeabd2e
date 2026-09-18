@@ -19,13 +19,15 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
-def _put_rule(client, device_id="truck-01", **overrides):
+def _put_rule(client, device_id="truck-01", *, effective_at=None, **overrides):
     payload = {
         "upper_limit": 8.0,
         "lower_limit": 2.0,
         "tolerance_seconds": 300,
         "max_gap_seconds": 1800,
     }
+    if effective_at is not None:
+        payload["effective_at"] = effective_at
     payload.update(overrides)
     return client.put(f"/api/v1/devices/{device_id}/rule", json=payload)
 
@@ -157,3 +159,124 @@ class TestIngestAndEvents:
         types = {e["device_id"]: e["event_type"] for e in events}
         assert types["truck-01"] == "high"
         assert types["truck-02"] == "low"
+
+
+class TestRuleVersions:
+    def test_immediate_update_creates_newer_version(self, client):
+        first = _put_rule(client, "truck-01")
+        assert first.status_code == 200
+        assert first.json()["version"] == 1
+        second = _put_rule(client, "truck-01", upper_limit=9.0)
+        assert second.status_code == 200
+        assert second.json()["version"] == 2
+        assert second.json()["upper_limit"] == 9.0
+        # GET rule 返回最新版本
+        assert client.get("/api/v1/devices/truck-01/rule").json()["version"] == 2
+
+    def test_scheduled_version_is_listed_in_effective_order(self, client):
+        _put_rule(client, "truck-01")
+        resp = _put_rule(
+            client, "truck-01",
+            upper_limit=10.0,
+            effective_at=(BASE + timedelta(hours=2)).isoformat(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["version"] == 2
+        versions = client.get(
+            "/api/v1/devices/truck-01/rule/versions"
+        ).json()
+        assert [v["version"] for v in versions] == [1, 2]
+        assert versions[1]["effective_at"].startswith("2026-01-01T02:00:00")
+
+    def test_versions_endpoint_404_for_unknown_device(self, client):
+        assert client.get(
+            "/api/v1/devices/ghost/rule/versions"
+        ).status_code == 404
+
+    def test_backdated_write_is_rejected_with_409(self, client):
+        _put_rule(client, "truck-01")
+        _put_rule(
+            client, "truck-01", upper_limit=10.0,
+            effective_at=(BASE + timedelta(hours=2)).isoformat(),
+        )
+        # 最新版本 02:00 生效，倒序写入 01:00 生效的版本 → 409
+        resp = _put_rule(
+            client, "truck-01", upper_limit=11.0,
+            effective_at=(BASE + timedelta(hours=1)).isoformat(),
+        )
+        assert resp.status_code == 409
+        # 拒绝后没有新增版本
+        versions = client.get(
+            "/api/v1/devices/truck-01/rule/versions"
+        ).json()
+        assert [v["version"] for v in versions] == [1, 2]
+
+    def test_equal_effective_at_is_rejected(self, client):
+        _put_rule(client, "truck-01")
+        at = (BASE + timedelta(hours=2)).isoformat()
+        assert _put_rule(client, "truck-01", upper_limit=10.0,
+                         effective_at=at).status_code == 200
+        # 同一生效时间不允许第二个版本
+        resp = _put_rule(client, "truck-01", upper_limit=11.0,
+                         effective_at=at)
+        assert resp.status_code in (409, 422)
+
+    def test_future_versions_do_not_apply_yet(self, client):
+        _put_rule(client, "truck-01", upper_limit=8.0)
+        # 2 小时后上限放宽到 100℃（即 2 小时后不再有超限）
+        _put_rule(
+            client, "truck-01", upper_limit=100.0,
+            effective_at=(BASE + timedelta(hours=2)).isoformat(),
+        )
+        _send_readings(client, "truck-01", [
+            (0, 9.0),     # v1 超限
+            (10, 5.0),    # v1 恢复，事件闭合
+            (130, 9.0),   # 已适用 v2：9.0 不超限 → 无新事件
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["rule_version"] == 1
+        assert ev["end_time"].startswith("2026-01-01T00:10")
+
+    def test_switch_point_forces_event_split(self, client):
+        _put_rule(client, "truck-01", upper_limit=8.0)
+        _put_rule(
+            client, "truck-01", upper_limit=9.0,
+            effective_at=(BASE + timedelta(minutes=20)).isoformat(),
+        )
+        _send_readings(client, "truck-01", [
+            (0, 9.0),     # v1 超限（v1 上限 8）
+            (10, 9.5),    # v1 持续超限
+            (20, 9.5),    # 切换点：v2（上限 9）下仍超限 → 旧事件必须结束
+            (30, 5.0),
+        ])
+        events = client.get("/api/v1/devices/truck-01/events").json()
+        assert len(events) == 2
+        assert [e["rule_version"] for e in events] == [1, 2]
+        assert events[0]["end_time"].startswith("2026-01-01T00:10")
+        assert events[1]["start_time"].startswith("2026-01-01T00:20")
+        assert events[1]["end_time"].startswith("2026-01-01T00:30")
+        assert events[0]["rule_effective_at"] != events[1]["rule_effective_at"]
+
+    def test_events_within_time_window_use_versions(self, client):
+        _put_rule(client, "truck-01", upper_limit=8.0)
+        _put_rule(
+            client, "truck-01", upper_limit=9.0,
+            effective_at=(BASE + timedelta(minutes=20)).isoformat(),
+        )
+        _send_readings(client, "truck-01", [
+            (0, 9.0),
+            (10, 5.0),
+            (20, 9.5),
+            (30, 5.0),
+        ])
+        # 查询完全位于 v2 生效后的窗口，只返回 v2 事件
+        events = client.get(
+            "/api/v1/devices/truck-01/events",
+            params={"start": (BASE + timedelta(minutes=15)).isoformat(),
+                    "end": (BASE + timedelta(minutes=60)).isoformat()},
+        ).json()
+        assert len(events) == 1
+        assert events[0]["rule_version"] == 2
+

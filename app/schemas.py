@@ -23,6 +23,15 @@ class DeviceRuleIn(BaseModel):
     max_gap_seconds: int = Field(
         1800, ge=0,
         description="最大上报间隔（秒）：相邻读数间隔超过该值则强制分段")
+    effective_at: datetime | None = Field(
+        None,
+        description="规则版本生效时间（ISO 8601，无时区按 UTC）；"
+                    "不传则立即生效。不得早于该设备最新版本的生效时间")
+
+    @field_validator("effective_at")
+    @classmethod
+    def _normalize_effective_at(cls, v: datetime | None) -> datetime | None:
+        return to_utc(v) if v is not None else None
 
     @model_validator(mode="after")
     def _check_limits(self):
@@ -31,8 +40,30 @@ class DeviceRuleIn(BaseModel):
         return self
 
 
-class DeviceRule(DeviceRuleIn):
+class DeviceRule(BaseModel):
+    """设备当前最新的规则版本。"""
+
     device_id: str
+    version: int = Field(..., description="规则版本号（同一设备内单调递增）")
+    upper_limit: float
+    lower_limit: float
+    tolerance_seconds: int
+    max_gap_seconds: int
+    effective_at: datetime = Field(..., description="该版本的生效时间（UTC）")
+    created_at: datetime
+    updated_at: datetime
+
+
+class DeviceRuleVersionOut(BaseModel):
+    """规则版本列表中的单条版本。"""
+
+    device_id: str
+    version: int
+    upper_limit: float
+    lower_limit: float
+    tolerance_seconds: int
+    max_gap_seconds: int
+    effective_at: datetime = Field(..., description="该版本的生效时间（UTC）")
     created_at: datetime
     updated_at: datetime
 
@@ -64,6 +95,9 @@ class ReadingOut(BaseModel):
 
 class EventOut(BaseModel):
     device_id: str
+    rule_version: int = Field(..., description="识别该事件所用的规则版本号")
+    rule_effective_at: datetime = Field(
+        ..., description="该规则版本的生效时间（UTC）")
     start_time: datetime = Field(..., description="事件起点（首个超限读数时间）")
     end_time: datetime = Field(..., description="事件终点（恢复正常的首个读数时间；未恢复则为最后超限时间）")
     ongoing: bool = Field(..., description="事件是否仍在持续（尚未观察到恢复）")
