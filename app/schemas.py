@@ -23,6 +23,10 @@ class DeviceRuleIn(BaseModel):
     max_gap_seconds: int = Field(
         1800, ge=0,
         description="最大上报间隔（秒）：相邻读数间隔超过该值则强制分段")
+    effective_at: datetime | None = Field(
+        None,
+        description="规则版本生效时间（ISO 8601，无时区按 UTC）。"
+                    "不传则立即生效；必须晚于该设备最新版本的生效时间")
 
     @model_validator(mode="after")
     def _check_limits(self):
@@ -30,11 +34,23 @@ class DeviceRuleIn(BaseModel):
             raise ValueError("lower_limit 必须小于 upper_limit")
         return self
 
+    @field_validator("effective_at")
+    @classmethod
+    def _normalize_effective_at(cls, v: datetime | None) -> datetime | None:
+        return to_utc(v) if v is not None else None
 
-class DeviceRule(DeviceRuleIn):
+
+class DeviceRule(BaseModel):
+    """设备规则（单个版本）。GET /rule 返回最新版本；GET /rule/versions 返回全部版本。"""
     device_id: str
-    created_at: datetime
-    updated_at: datetime
+    version: int = Field(..., description="设备内规则版本号，从 1 开始递增")
+    upper_limit: float
+    lower_limit: float
+    tolerance_seconds: int
+    max_gap_seconds: int
+    effective_at: datetime = Field(..., description="该版本生效时间（UTC）")
+    created_at: datetime = Field(..., description="该版本写入时间（UTC）")
+    updated_at: datetime = Field(..., description="兼容字段，等同 created_at")
 
 
 class ReadingIn(BaseModel):
@@ -65,8 +81,8 @@ class ReadingOut(BaseModel):
 class EventOut(BaseModel):
     device_id: str
     start_time: datetime = Field(..., description="事件起点（首个超限读数时间）")
-    end_time: datetime = Field(..., description="事件终点（恢复正常的首个读数时间；未恢复则为最后超限时间）")
-    ongoing: bool = Field(..., description="事件是否仍在持续（尚未观察到恢复）")
+    end_time: datetime = Field(..., description="事件终点（恢复正常的首个读数时间；未恢复或被规则切换/数据中断强制结束时为最后超限时间）")
+    ongoing: bool = Field(..., description="事件是否仍在持续（尚未观察到恢复，且未被规则切换/数据中断强制结束）")
     duration_seconds: float = Field(..., description="事件起止跨度（秒）")
     violation_seconds: float = Field(..., description="累计超限时长（秒）")
     event_type: str = Field(..., description="high=超上限 / low=超下限 / mixed=两者都有")
@@ -75,3 +91,5 @@ class EventOut(BaseModel):
     max_temp: float
     min_temp: float
     reading_count: int
+    rule_version: int = Field(..., description="事件所适用的规则版本号")
+    rule_effective_at: datetime = Field(..., description="事件所适用规则版本的生效时间（UTC）")

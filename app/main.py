@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
 
 from . import database as db
-from .events import Reading, Rule, detect_events
+from .events import Reading, Rule, RuleVersion, detect_events_versioned
 from .schemas import (
     DeviceRule,
     DeviceRuleIn,
@@ -28,10 +28,12 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Cold Chain Temperature Event API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "接收设备按时间上报的温度读数，按每个设备配置的上下限与容忍时长"
         "识别连续超温事件，返回事件起止时间、峰值与累计超限时长。"
+        "规则支持版本化：每条读数应用其当时已生效的规则版本，"
+        "规则切换点强制结束旧事件，事件结果带 rule_version / rule_effective_at。"
     ),
     lifespan=lifespan,
 )
@@ -42,28 +44,51 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-# ---------- 设备规则配置 ----------
+# ---------- 设备规则配置（版本化） ----------
 
 @app.put("/api/v1/devices/{device_id}/rule", response_model=DeviceRule)
 def put_device_rule(device_id: str, rule: DeviceRuleIn):
-    """创建或更新设备的温度规则（上下限、容忍时长、最大间隔）。"""
-    return db.upsert_rule(
-        device_id,
-        rule.upper_limit,
-        rule.lower_limit,
-        rule.tolerance_seconds,
-        rule.max_gap_seconds,
-    )
+    """创建或追加设备的规则版本。
+
+    - 不传 effective_at：立即生效（生效时间取当前 UTC 时间）；
+    - 传 effective_at：自该时间起生效，按读数时间选择版本；
+    - effective_at 必须严格晚于该设备最新版本的生效时间，否则 409。
+    """
+    effective_at = rule.effective_at
+    if effective_at is None:
+        # 未传 effective_at：立即生效
+        effective_at = datetime.now(timezone.utc)
+    try:
+        return db.add_rule_version(
+            device_id,
+            rule.upper_limit,
+            rule.lower_limit,
+            rule.tolerance_seconds,
+            rule.max_gap_seconds,
+            effective_at.isoformat(),
+        )
+    except db.RuleOrderingError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/v1/devices", response_model=list[DeviceRule])
 def list_devices():
-    """列出全部已配置规则的设备。"""
+    """列出全部设备（每个设备返回其最新版本规则）。"""
     return db.list_rules()
+
+
+@app.get("/api/v1/devices/{device_id}/rule/versions", response_model=list[DeviceRule])
+def list_device_rule_versions(device_id: str):
+    """按版本号（生效时间）升序列出某设备的全部规则版本。"""
+    versions = db.list_rule_versions(device_id)
+    if not versions:
+        raise HTTPException(404, f"设备 {device_id!r} 尚未配置规则")
+    return versions
 
 
 @app.get("/api/v1/devices/{device_id}/rule", response_model=DeviceRule)
 def get_device_rule(device_id: str):
+    """查询设备当前最新版本的规则。"""
     rule = db.get_rule(device_id)
     if rule is None:
         raise HTTPException(404, f"设备 {device_id!r} 尚未配置规则")
@@ -72,7 +97,7 @@ def get_device_rule(device_id: str):
 
 @app.delete("/api/v1/devices/{device_id}")
 def delete_device(device_id: str):
-    """删除设备规则及其全部温度读数。"""
+    """删除设备全部规则版本及其全部温度读数。"""
     if not db.delete_device(device_id):
         raise HTTPException(404, f"设备 {device_id!r} 不存在")
     return {"deleted": device_id}
@@ -111,22 +136,29 @@ def list_readings(
 def _events_for_device(device_id: str,
                        start: datetime | None,
                        end: datetime | None) -> list[EventOut]:
-    rule_row = db.get_rule(device_id)
-    if rule_row is None:
+    version_rows = db.list_rule_versions(device_id)
+    if not version_rows:
         raise HTTPException(404, f"设备 {device_id!r} 尚未配置规则，无法分析事件")
-    rule = Rule(
-        upper_limit=rule_row["upper_limit"],
-        lower_limit=rule_row["lower_limit"],
-        tolerance_seconds=rule_row["tolerance_seconds"],
-        max_gap_seconds=rule_row["max_gap_seconds"],
-    )
+    versions = [
+        RuleVersion(
+            version=row["version"],
+            effective_at=to_utc(datetime.fromisoformat(row["effective_at"])),
+            rule=Rule(
+                upper_limit=row["upper_limit"],
+                lower_limit=row["lower_limit"],
+                tolerance_seconds=row["tolerance_seconds"],
+                max_gap_seconds=row["max_gap_seconds"],
+            ),
+        )
+        for row in version_rows
+    ]
     end_iso = to_utc(end).isoformat() if end else None
     rows = db.fetch_readings(device_id, end_iso)
     readings = [
         Reading(ts=to_utc(datetime.fromisoformat(r["ts"])), temperature=r["temperature"])
         for r in rows
     ]
-    events = detect_events(readings, rule)
+    events = detect_events_versioned(readings, versions)
 
     start_utc = to_utc(start) if start else None
     end_utc = to_utc(end) if end else None
@@ -147,7 +179,7 @@ def device_events(
     start: datetime | None = Query(None, description="起始时间（含），ISO 8601"),
     end: datetime | None = Query(None, description="结束时间（含），ISO 8601"),
 ):
-    """查询单个设备在指定时间范围内的超温事件。"""
+    """查询单个设备在指定时间范围内的超温事件（按读数当时生效的规则版本计算）。"""
     return _events_for_device(device_id, start, end)
 
 
